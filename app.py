@@ -495,14 +495,68 @@ def create_candlestick_chart(
         template="plotly_white",
         hovermode="x unified",
         height=750,
+        margin=dict(b=110),  # room for the legend below the bottom subplot
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.12,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11),
+        ),
     )
     return fig
 
 
 
 st.set_page_config(page_title="NSE Bull Flag Scanner", layout="wide")
+
+# --- Mobile-responsive CSS ---
+# Rules under @media (max-width: 768px) only fire on phones / narrow viewports.
+# Desktop layout is untouched.
+st.markdown(
+    """
+    <style>
+      /* Tables / DataFrames: always horizontally scrollable so a wide
+         leaderboard never blows out the viewport. */
+      [data-testid="stDataFrame"] { overflow-x: auto !important; }
+
+      @media (max-width: 768px) {
+        /* Tighten root font + headings */
+        html, body, .stApp { font-size: 14px !important; }
+        h1 { font-size: 1.4rem !important; }
+        h2 { font-size: 1.15rem !important; }
+        h3 { font-size: 1.05rem !important; }
+
+        /* Stack horizontal-block columns vertically on phones.
+           Affects DMA Status row, metric cards, search-row, etc. */
+        [data-testid="stHorizontalBlock"] {
+          flex-wrap: wrap !important;
+        }
+        [data-testid="stHorizontalBlock"] > div {
+          flex: 1 1 100% !important;
+          min-width: 100% !important;
+        }
+
+        /* Compact st.metric cards */
+        [data-testid="stMetricLabel"] { font-size: 12px !important; }
+        [data-testid="stMetricValue"] { font-size: 18px !important; }
+
+        /* Reduce plotly chart heights */
+        .js-plotly-plot, .plotly-graph-div {
+          height: 480px !important;
+        }
+        /* Smaller plotly legend text */
+        .legend text { font-size: 10px !important; }
+
+        /* Reduce sidebar padding so it consumes less horizontal real estate */
+        section[data-testid="stSidebar"] { padding: 0.5rem !important; }
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Initialize session state
 if "scan_results_df" not in st.session_state:
@@ -517,11 +571,17 @@ st.sidebar.markdown("Scan a custom symbol list or choose a preset watchlist.")
 def _on_broad_change():
     if st.session_state.broad_radio != NONE_OPT:
         st.session_state.sector_radio = NONE_OPT
+        # Selecting a watchlist resets the search/typed pickers so the user
+        # isn't silently mixing watchlist + custom symbols.
+        st.session_state.custom_picks = []
+        st.session_state.custom_text = ""
 
 
 def _on_sector_change():
     if st.session_state.sector_radio != NONE_OPT:
         st.session_state.broad_radio = NONE_OPT
+        st.session_state.custom_picks = []
+        st.session_state.custom_text = ""
 
 
 with st.sidebar.expander("Broad Market", expanded=False):
@@ -611,6 +671,8 @@ with picker_col:
         default=[],
         placeholder="e.g. RELIANCE, INFY, TCS",
         key="custom_picks",
+        max_selections=20,
+        help="Up to 20 stocks. Selecting a watchlist clears these picks.",
     )
 with unlisted_col:
     custom_text = st.text_input(
@@ -642,9 +704,16 @@ custom_combined = list(dict.fromkeys([*custom_picks, *typed_symbols]))
 
 if custom_combined:
     n = len(custom_combined)
-    st.caption(
-        f"**{n} stock{'s' if n != 1 else ''} selected** — overriding watchlist"
-    )
+    badge_col, clear_col = st.columns([5, 1])
+    with badge_col:
+        st.caption(
+            f"**{n} stock{'s' if n != 1 else ''} selected** — overriding watchlist"
+        )
+    with clear_col:
+        if st.button("Clear", key="clear_custom", width="stretch"):
+            st.session_state.custom_picks = []
+            st.session_state.custom_text = ""
+            st.rerun()
 
 st.divider()
 
