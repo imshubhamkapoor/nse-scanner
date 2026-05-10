@@ -1,6 +1,9 @@
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -8,6 +11,9 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from nse_scanner import fetch_stock_data, detect_swings, score_stock, compute_rsi, SECTOR_MAP
+
+SCAN_WORKERS = 5
+SCAN_CACHE_TTL_SECONDS = 3600
 
 # (group, display label, watchlist filename relative to this script). Display
 # order in the sidebar matches this list. Labels get a stock count appended at
@@ -203,41 +209,73 @@ def parse_symbols(symbols_text: str) -> list[str]:
     return [symbol.upper() for symbol in symbols if symbol.strip()]
 
 
-def scan_symbols(symbols: list[str], start_date: date, end_date: date) -> list[dict]:
-    results = []
-    for symbol in symbols:
-        item = {"symbol": symbol, "score": None, "comment": None, "status": "ok"}
-        try:
-            df = fetch_stock_data(symbol, start_date, end_date)
-            if len(df) < 60:
-                item["status"] = "insufficient data"
-                results.append(item)
-                continue
+@st.cache_data(ttl=SCAN_CACHE_TTL_SECONDS, show_spinner=False)
+def _scan_one_symbol(symbol: str, start_date: date, end_date: date) -> dict:
+    """Fetch + score one symbol. Cached for 1 hour keyed by (symbol, dates)."""
+    item: dict = {"symbol": symbol, "score": None, "comment": None, "status": "ok"}
+    try:
+        df = fetch_stock_data(symbol, start_date, end_date)
+        if len(df) < 60:
+            item["status"] = "insufficient data"
+            return item
 
-            swing_highs, swing_lows = detect_swings(df, lookback=5)
-            details = score_stock(df, swing_highs, swing_lows)
+        swing_highs, swing_lows = detect_swings(df, lookback=5)
+        details = score_stock(df, swing_highs, swing_lows)
 
-            dma50 = df["Close"].rolling(50).mean().iloc[-1]
-            last_close = details.get("last_close", df["Close"].iloc[-1])
-            above_50dma = bool(pd.notna(dma50) and last_close > dma50)
+        dma50 = df["Close"].rolling(50).mean().iloc[-1]
+        last_close = details.get("last_close", df["Close"].iloc[-1])
+        above_50dma = bool(pd.notna(dma50) and last_close > dma50)
 
-            item.update(
-                score=details.get("score", 0),
-                comment=details.get("comment", ""),
-                hh_valid=details.get("hh_valid", 0),
-                hh_total=details.get("hh_total", 0),
-                hl_valid=details.get("hl_valid", 0),
-                hl_total=details.get("hl_total", 0),
-                last_close=last_close,
-                above_50dma=above_50dma,
-                rsi14=details.get("rsi14"),
-                sector=SECTOR_MAP.get(symbol, "Other"),
-                status="ok",
-            )
-        except Exception as exc:
-            item["status"] = f"error: {exc}"
-        results.append(item)
-    return results
+        item.update(
+            score=details.get("score", 0),
+            comment=details.get("comment", ""),
+            hh_valid=details.get("hh_valid", 0),
+            hh_total=details.get("hh_total", 0),
+            hl_valid=details.get("hl_valid", 0),
+            hl_total=details.get("hl_total", 0),
+            last_close=last_close,
+            above_50dma=above_50dma,
+            rsi14=details.get("rsi14"),
+            sector=SECTOR_MAP.get(symbol, "Other"),
+            status="ok",
+        )
+    except Exception as exc:
+        item["status"] = f"error: {exc}"
+    return item
+
+
+def scan_symbols(
+    symbols: list[str],
+    start_date: date,
+    end_date: date,
+    progress_callback: Callable[[int, int, float], None] | None = None,
+) -> list[dict]:
+    """Fetch + score `symbols` in parallel (5 workers), preserving input order.
+    progress_callback is invoked on the main thread after each completion with
+    (completed_count, total, elapsed_seconds)."""
+    results: list[dict | None] = [None] * len(symbols)
+    started_at = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
+        future_to_idx = {
+            executor.submit(_scan_one_symbol, sym, start_date, end_date): i
+            for i, sym in enumerate(symbols)
+        }
+        for completed, future in enumerate(as_completed(future_to_idx), start=1):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                results[idx] = {
+                    "symbol": symbols[idx],
+                    "score": None,
+                    "comment": None,
+                    "status": f"error: {exc}",
+                }
+            if progress_callback is not None:
+                progress_callback(completed, len(symbols), time.monotonic() - started_at)
+
+    return [r for r in results if r is not None]
 
 
 def create_candlestick_chart(
@@ -474,8 +512,28 @@ if scan_clicked:
     elif selected_start > selected_end:
         st.warning("Please choose a valid date range.")
     else:
-        with st.spinner(f"Scanning {len(symbols)} symbols..."):
-            scan_results = scan_symbols(symbols, selected_start, selected_end)
+        progress_bar = st.progress(0.0, text=f"Scanning {len(symbols)} symbols...")
+        eta_text = st.empty()
+
+        def _on_progress(completed: int, total: int, elapsed: float) -> None:
+            fraction = completed / total
+            rate = completed / elapsed if elapsed > 0 else 0
+            remaining = (total - completed) / rate if rate > 0 else 0
+            progress_bar.progress(
+                fraction,
+                text=f"Scanning {completed}/{total} symbols ({fraction:.0%})",
+            )
+            eta_text.caption(
+                f"Elapsed {elapsed:.1f}s · ~{remaining:.0f}s remaining "
+                f"({rate:.1f} symbols/sec across {SCAN_WORKERS} workers)"
+            )
+
+        scan_results = scan_symbols(
+            symbols, selected_start, selected_end,
+            progress_callback=_on_progress,
+        )
+        progress_bar.empty()
+        eta_text.empty()
 
         results_df = pd.DataFrame(scan_results)
         st.session_state.scan_results_df = results_df
