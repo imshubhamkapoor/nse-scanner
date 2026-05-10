@@ -1,4 +1,3 @@
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
@@ -70,6 +69,23 @@ def _load_avg_volumes() -> dict[str, int]:
         return {}
     df = pd.read_csv(path)
     return dict(zip(df["symbol"].astype(str), df["avg_volume"].astype(int)))
+
+
+@st.cache_data
+def _load_master_symbol_list() -> list[str]:
+    """Sorted union of all symbols across the configured watchlist files.
+    Powers the sidebar autocomplete."""
+    seen: set[str] = set()
+    base = Path(__file__).parent
+    for _, _, rel in WATCHLIST_FILES:
+        full = base / rel
+        if not full.exists():
+            continue
+        for line in full.read_text().splitlines():
+            sym = line.strip().upper()
+            if sym:
+                seen.add(sym)
+    return sorted(seen)
 
 
 def load_watchlist(name: str, top_n: int | None = None) -> list[str]:
@@ -202,11 +218,6 @@ def color_rsi(val) -> str:
     if rsi > 70:
         return f"background-color: #C8E6C9; {_CELL_BASE}"
     return ""
-
-
-def parse_symbols(symbols_text: str) -> list[str]:
-    symbols = re.split(r"[,\s]+", symbols_text or "")
-    return [symbol.upper() for symbol in symbols if symbol.strip()]
 
 
 @st.cache_data(ttl=SCAN_CACHE_TTL_SECONDS, show_spinner=False)
@@ -429,7 +440,7 @@ def _on_sector_change():
         st.session_state.broad_radio = NONE_OPT
 
 
-with st.sidebar.expander("Broad Market", expanded=True):
+with st.sidebar.expander("Broad Market", expanded=False):
     st.radio(
         "Broad market watchlist",
         [NONE_OPT, *WATCHLIST_GROUPS.get("Broad Market", [])],
@@ -472,12 +483,6 @@ if selected_watchlist:
             help="Ranks symbols by 20-day average volume from stock_metadata.csv.",
         )
 
-custom_symbols = st.sidebar.text_area(
-    "Stock symbols (comma-separated)",
-    value="",
-    help="Type NSE symbols like RELIANCE, INFY, TCS separated by commas or spaces.",
-)
-
 end_date = date.today()
 start_date = end_date - timedelta(days=365)
 selected_range = st.sidebar.date_input(
@@ -495,20 +500,81 @@ else:
 if selected_start > selected_end:
     st.sidebar.error("Start date must be before end date.")
 
-scan_clicked = st.sidebar.button("Scan")
+sidebar_scan = st.sidebar.button(
+    "Scan", type="primary", width="stretch", key="scan_sidebar"
+)
 
 st.title("NSE Bull Flag Scanner")
 
-if scan_clicked:
-    symbols = []
-    if selected_watchlist:
-        symbols.extend(load_watchlist(selected_watchlist, top_n=top_n_limit))
+# --- Stock selector (full-width, above the tabs) ---
+master_symbols = _load_master_symbol_list()
 
-    symbols.extend(parse_symbols(custom_symbols))
-    symbols = [symbol for symbol in dict.fromkeys(symbols) if symbol]
+# Align all column children to the bottom edge so labelled inputs and the
+# unlabeled button line up at the field baseline. Note: this rule is global
+# and affects every horizontal block in the app — most other column rows in
+# this app contain widgets of similar heights, so the visual impact elsewhere
+# is minimal, but worth knowing.
+st.markdown(
+    '<style>[data-testid="stHorizontalBlock"] {align-items: end;}</style>',
+    unsafe_allow_html=True,
+)
+
+picker_col, unlisted_col, scan_col = st.columns([5, 2, 1])
+with picker_col:
+    custom_picks = st.multiselect(
+        "Search or type stocks",
+        options=master_symbols,
+        default=[],
+        placeholder="e.g. RELIANCE, INFY, TCS",
+        key="custom_picks",
+    )
+with unlisted_col:
+    custom_text = st.text_input(
+        "Add unlisted symbol",
+        value="",
+        placeholder="e.g. NEWLISTING",
+        key="custom_text",
+        help="For NSE symbols not present in any watchlist file.",
+    )
+with scan_col:
+    main_scan = st.button(
+        "Scan", type="primary", width="stretch", key="scan_main"
+    )
+
+# Either button triggers the same scan
+scan_clicked = main_scan or sidebar_scan
+
+st.caption(
+    f":grey[Search from {len(master_symbols)} indexed stocks "
+    "or type any NSE symbol]"
+)
+
+typed_symbols = [
+    s.strip().upper()
+    for s in custom_text.replace(",", " ").split()
+    if s.strip()
+]
+custom_combined = list(dict.fromkeys([*custom_picks, *typed_symbols]))
+
+if custom_combined:
+    n = len(custom_combined)
+    st.caption(
+        f"**{n} stock{'s' if n != 1 else ''} selected** — overriding watchlist"
+    )
+
+st.divider()
+
+if scan_clicked:
+    # Either custom-input source (autocomplete + typed) overrides the watchlist.
+    if custom_combined:
+        symbols = custom_combined
+    elif selected_watchlist:
+        symbols = load_watchlist(selected_watchlist, top_n=top_n_limit)
+    else:
+        symbols = []
 
     if not symbols:
-        st.warning("Please enter at least one stock symbol or select a watchlist.")
+        st.warning("Pick a watchlist or search for at least one stock.")
     elif selected_start > selected_end:
         st.warning("Please choose a valid date range.")
     else:
