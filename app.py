@@ -29,6 +29,14 @@ SCAN_WORKERS = 2 if IS_CLOUD else 5
 SCAN_CACHE_TTL_SECONDS = 3600
 RETRY_DELAYS = (2, 4, 8)  # seconds; 3 attempts total
 
+# Data source: "auto" (jugaad once, fall back to yfinance with retries),
+# "jugaad" (jugaad with retries, no fallback), or "yfinance" (yfinance only).
+# Override via env var DATA_SOURCE or by editing this constant directly.
+_VALID_DATA_SOURCES = {"auto", "jugaad", "yfinance"}
+DATA_SOURCE = os.environ.get("DATA_SOURCE", "auto").lower()
+if DATA_SOURCE not in _VALID_DATA_SOURCES:
+    DATA_SOURCE = "auto"
+
 # (group, display label, watchlist filename relative to this script). Display
 # order in the sidebar matches this list. Labels get a stock count appended at
 # runtime from the file's contents, e.g. "Nifty 50 (50)".
@@ -235,22 +243,58 @@ def color_rsi(val) -> str:
     return ""
 
 
+def _fetch_via_yfinance(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """yfinance fallback for NSE stocks (uses .NS suffix). Returns the same
+    schema as nse_scanner.fetch_stock_data: Date / Open / High / Low / Close /
+    Volume, sorted ascending, tz-naive. Imported lazily so the local CLI
+    doesn't require yfinance to be installed."""
+    import yfinance as yf
+
+    ticker = yf.Ticker(f"{symbol}.NS")
+    df = ticker.history(
+        start=start_date,
+        end=end_date + timedelta(days=1),  # yfinance treats end as exclusive
+        auto_adjust=False,
+    )
+    if df.empty:
+        raise ValueError(f"yfinance returned no data for {symbol}.NS")
+    df = df.reset_index()
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    return (
+        df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+
+
 def _fetch_with_retry(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
-    """fetch_stock_data with exponential-backoff retry. NSE rate-limits will
-    surface as JSONDecodeError ('Expecting value: line 1 column 1') — those
-    are exactly what the retries catch. After all attempts fail, raises a
-    RuntimeError summarising the attempt count so cache_data does NOT cache
-    the error result."""
+    """Source-aware fetch with exponential-backoff retry. Dispatch:
+      - DATA_SOURCE='auto'     → jugaad once, then yfinance with full retries
+      - DATA_SOURCE='jugaad'   → jugaad with full retries
+      - DATA_SOURCE='yfinance' → yfinance with full retries
+    NSE rate-limits surface as JSONDecodeError from jugaad, which the retry
+    loop / yfinance fallback both handle. Fetch failures raise RuntimeError
+    so cache_data does not cache the error."""
+    if DATA_SOURCE == "jugaad":
+        plan = [("jugaad", len(RETRY_DELAYS))]
+    elif DATA_SOURCE == "yfinance":
+        plan = [("yfinance", len(RETRY_DELAYS))]
+    else:  # auto
+        plan = [("jugaad", 1), ("yfinance", len(RETRY_DELAYS))]
+
     last_exc: Exception | None = None
-    for attempt, delay in enumerate(RETRY_DELAYS, start=1):
-        try:
-            return fetch_stock_data(symbol, start_date, end_date)
-        except Exception as exc:
-            last_exc = exc
-            if attempt < len(RETRY_DELAYS):
-                time.sleep(delay)
+    for source, max_attempts in plan:
+        fetcher = fetch_stock_data if source == "jugaad" else _fetch_via_yfinance
+        for attempt in range(max_attempts):
+            try:
+                return fetcher(symbol, start_date, end_date)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(RETRY_DELAYS[attempt])
+
     raise RuntimeError(
-        f"rate-limited or unreachable after {len(RETRY_DELAYS)} attempts: "
+        f"all data sources failed for {symbol} (DATA_SOURCE={DATA_SOURCE}): "
         f"{type(last_exc).__name__}: {last_exc}"
     ) from last_exc
 
@@ -633,7 +677,8 @@ if scan_clicked:
                 f"Elapsed {elapsed:.1f}s · ~{remaining:.0f}s remaining "
                 f"({rate:.1f} symbols/sec across {SCAN_WORKERS} worker"
                 f"{'s' if SCAN_WORKERS != 1 else ''}"
-                f"{' · cloud mode' if IS_CLOUD else ''})"
+                f"{' · cloud mode' if IS_CLOUD else ''}"
+                f" · source: {DATA_SOURCE})"
             )
 
         scan_results = scan_symbols(
