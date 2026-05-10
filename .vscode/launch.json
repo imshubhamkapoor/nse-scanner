@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Scan: RELIANCE INFY",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/nse_scanner.py",
+      "args": ["--stocks", "RELIANCE", "INFY"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Scan: Nifty 50",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/nse_scanner.py",
+      "args": ["--file", "watchlists/nifty50.txt"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Scan: Pharma",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/nse_scanner.py",
+      "args": ["--file", "watchlists/pharma.txt"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Scan: prompt for args",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/nse_scanner.py",
+      "args": "${command:pickArgs}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
