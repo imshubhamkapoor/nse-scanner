@@ -1,7 +1,6 @@
 jugaad-data>=0.30
 mplfinance>=0.12.10b0
 pandas>=2.0
-numpy<1.24
-streamlit>=1.0
+numpy>=1.23
+streamlit>=1.49
 plotly>=5.0
-
