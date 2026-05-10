@@ -1,3 +1,4 @@
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
@@ -11,8 +12,22 @@ from plotly.subplots import make_subplots
 
 from nse_scanner import fetch_stock_data, detect_swings, score_stock, compute_rsi, SECTOR_MAP
 
-SCAN_WORKERS = 5
+
+def is_streamlit_cloud() -> bool:
+    """Best-effort detection of Streamlit Community Cloud's runtime — used to
+    pick conservative defaults (fewer workers, more aggressive retries) since
+    NSE rate-limits cloud egress IPs harder than residential ones."""
+    return (
+        os.path.exists("/mount/src")
+        or os.environ.get("HOSTNAME", "").startswith("streamlit")
+        or "STREAMLIT_SHARING_MODE" in os.environ
+    )
+
+
+IS_CLOUD = is_streamlit_cloud()
+SCAN_WORKERS = 2 if IS_CLOUD else 5
 SCAN_CACHE_TTL_SECONDS = 3600
+RETRY_DELAYS = (2, 4, 8)  # seconds; 3 attempts total
 
 # (group, display label, watchlist filename relative to this script). Display
 # order in the sidebar matches this list. Labels get a stock count appended at
@@ -220,39 +235,62 @@ def color_rsi(val) -> str:
     return ""
 
 
+def _fetch_with_retry(symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """fetch_stock_data with exponential-backoff retry. NSE rate-limits will
+    surface as JSONDecodeError ('Expecting value: line 1 column 1') — those
+    are exactly what the retries catch. After all attempts fail, raises a
+    RuntimeError summarising the attempt count so cache_data does NOT cache
+    the error result."""
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate(RETRY_DELAYS, start=1):
+        try:
+            return fetch_stock_data(symbol, start_date, end_date)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < len(RETRY_DELAYS):
+                time.sleep(delay)
+    raise RuntimeError(
+        f"rate-limited or unreachable after {len(RETRY_DELAYS)} attempts: "
+        f"{type(last_exc).__name__}: {last_exc}"
+    ) from last_exc
+
+
 @st.cache_data(ttl=SCAN_CACHE_TTL_SECONDS, show_spinner=False)
 def _scan_one_symbol(symbol: str, start_date: date, end_date: date) -> dict:
-    """Fetch + score one symbol. Cached for 1 hour keyed by (symbol, dates)."""
-    item: dict = {"symbol": symbol, "score": None, "comment": None, "status": "ok"}
-    try:
-        df = fetch_stock_data(symbol, start_date, end_date)
-        if len(df) < 60:
-            item["status"] = "insufficient data"
-            return item
+    """Fetch + score one symbol. Successful results and 'insufficient data'
+    rows are cached for 1 hour. Fetch failures (after retries) propagate as
+    exceptions so they're NOT cached — `scan_symbols` catches them and
+    surfaces an error row, while leaving the cache available for retry."""
+    df = _fetch_with_retry(symbol, start_date, end_date)
+    if len(df) < 60:
+        return {
+            "symbol": symbol,
+            "score": None,
+            "comment": None,
+            "status": "insufficient data",
+        }
 
-        swing_highs, swing_lows = detect_swings(df, lookback=5)
-        details = score_stock(df, swing_highs, swing_lows)
+    swing_highs, swing_lows = detect_swings(df, lookback=5)
+    details = score_stock(df, swing_highs, swing_lows)
 
-        dma50 = df["Close"].rolling(50).mean().iloc[-1]
-        last_close = details.get("last_close", df["Close"].iloc[-1])
-        above_50dma = bool(pd.notna(dma50) and last_close > dma50)
+    dma50 = df["Close"].rolling(50).mean().iloc[-1]
+    last_close = details.get("last_close", df["Close"].iloc[-1])
+    above_50dma = bool(pd.notna(dma50) and last_close > dma50)
 
-        item.update(
-            score=details.get("score", 0),
-            comment=details.get("comment", ""),
-            hh_valid=details.get("hh_valid", 0),
-            hh_total=details.get("hh_total", 0),
-            hl_valid=details.get("hl_valid", 0),
-            hl_total=details.get("hl_total", 0),
-            last_close=last_close,
-            above_50dma=above_50dma,
-            rsi14=details.get("rsi14"),
-            sector=SECTOR_MAP.get(symbol, "Other"),
-            status="ok",
-        )
-    except Exception as exc:
-        item["status"] = f"error: {exc}"
-    return item
+    return {
+        "symbol": symbol,
+        "score": details.get("score", 0),
+        "comment": details.get("comment", ""),
+        "hh_valid": details.get("hh_valid", 0),
+        "hh_total": details.get("hh_total", 0),
+        "hl_valid": details.get("hl_valid", 0),
+        "hl_total": details.get("hl_total", 0),
+        "last_close": last_close,
+        "above_50dma": above_50dma,
+        "rsi14": details.get("rsi14"),
+        "sector": SECTOR_MAP.get(symbol, "Other"),
+        "status": "ok",
+    }
 
 
 def scan_symbols(
@@ -261,7 +299,9 @@ def scan_symbols(
     end_date: date,
     progress_callback: Callable[[int, int, float], None] | None = None,
 ) -> list[dict]:
-    """Fetch + score `symbols` in parallel (5 workers), preserving input order.
+    """Fetch + score `symbols` in parallel, preserving input order. Worker
+    count is environment-aware: 5 locally, 2 on Streamlit Cloud (gentler on
+    NSE's rate limits which hit cloud egress IPs harder).
     progress_callback is invoked on the main thread after each completion with
     (completed_count, total, elapsed_seconds)."""
     results: list[dict | None] = [None] * len(symbols)
@@ -591,7 +631,9 @@ if scan_clicked:
             )
             eta_text.caption(
                 f"Elapsed {elapsed:.1f}s · ~{remaining:.0f}s remaining "
-                f"({rate:.1f} symbols/sec across {SCAN_WORKERS} workers)"
+                f"({rate:.1f} symbols/sec across {SCAN_WORKERS} worker"
+                f"{'s' if SCAN_WORKERS != 1 else ''}"
+                f"{' · cloud mode' if IS_CLOUD else ''})"
             )
 
         scan_results = scan_symbols(
