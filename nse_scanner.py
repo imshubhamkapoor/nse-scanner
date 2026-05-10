@@ -82,6 +82,21 @@ def detect_swings(df, lookback=5):
     return highs, lows
 
 
+# -- RSI (Wilder's smoothing) --
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Standard Wilder RSI. Returns a Series aligned to `close`; first `period`
+    values are NaN."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    # Wilder's smoothing == EMA with alpha = 1/period
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
 # -- Volume confirmation --
 def confirm_volume(df, idx, vol_avg_period=20, hh_mult=1.2, hl_mult=0.85, is_high=True):
     start = max(0, idx - vol_avg_period)
@@ -135,11 +150,13 @@ def score_stock(df, swing_highs, swing_lows, hh_mult=1.2, hl_mult=0.85):
     # Moving averages
     df["DMA21"] = df["Close"].rolling(21).mean()
     df["DMA50"] = df["Close"].rolling(50).mean()
+    df["DMA200"] = df["Close"].rolling(200).mean()
     df["VOL_DMA10"] = df["Volume"].rolling(10).mean()
 
     last = df.iloc[-1]
     above_21 = last["Close"] > last["DMA21"] if pd.notna(last["DMA21"]) else False
     above_50 = last["Close"] > last["DMA50"] if pd.notna(last["DMA50"]) else False
+    above_200 = last["Close"] > last["DMA200"] if pd.notna(last["DMA200"]) else False
 
     if above_21:
         score += 15
@@ -148,9 +165,16 @@ def score_stock(df, swing_highs, swing_lows, hh_mult=1.2, hl_mult=0.85):
 
     details["above_21dma"] = bool(above_21)
     details["above_50dma"] = bool(above_50)
+    details["above_200dma"] = bool(above_200)
     details["last_close"] = round(float(last["Close"]), 2)
     details["dma21"] = round(float(last["DMA21"]), 2) if pd.notna(last["DMA21"]) else None
     details["dma50"] = round(float(last["DMA50"]), 2) if pd.notna(last["DMA50"]) else None
+    details["dma200"] = round(float(last["DMA200"]), 2) if pd.notna(last["DMA200"]) else None
+
+    # RSI(14)
+    df["RSI14"] = compute_rsi(df["Close"], period=14)
+    last_rsi = df["RSI14"].iloc[-1]
+    details["rsi14"] = round(float(last_rsi), 1) if pd.notna(last_rsi) else None
 
     # Trend slope
     if pd.notna(last["DMA50"]):
